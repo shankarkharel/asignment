@@ -1,0 +1,86 @@
+# Local development stack. Secrets come from .env (generate with `npm run env:init`) - never committed.
+name: merchant-onboarding
+
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    NODE_ENV: ${NODE_ENV:-development}
+    DATABASE_HOST: postgres
+    DATABASE_PORT: 5432
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DATABASE_USER:?run npm run env:init}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:?run npm run env:init}
+      POSTGRES_DB: ${DATABASE_NAME:?run npm run env:init}
+    ports:
+      # Host port follows DATABASE_PORT so host-side tooling (npm run start:dev) matches.
+      - '127.0.0.1:${DATABASE_PORT:-5432}:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    # AOF persistence so queued jobs survive a Redis restart; noeviction is required by BullMQ.
+    command: ['redis-server', '--appendonly', 'yes', '--maxmemory-policy', 'noeviction']
+    ports:
+      - '127.0.0.1:${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *app
+    command: ['node', 'node_modules/typeorm/cli.js', '-d', 'dist/database/data-source.js', 'migration:run']
+    restart: 'no'
+
+  api:
+    <<: *app
+    ports:
+      - '127.0.0.1:${PORT:-3000}:3000'
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://localhost:3000/api/v1/health/ready || exit 1']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    <<: *app
+    command: ['node', 'dist/worker.js']
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  postgres-data:
+  redis-data:
